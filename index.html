@@ -167,6 +167,14 @@
       color: var(--muted);
     }
 
+    .status {
+      margin: -8px 0 16px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .status:empty { display: none; }
+    .status.error { color: var(--danger); }
+
     .footer {
       display: flex;
       justify-content: flex-end;
@@ -199,6 +207,8 @@
       <button type="submit" class="btn-primary">추가</button>
     </form>
 
+    <p class="status" id="status" role="status"></p>
+
     <ul class="list" id="list"></ul>
     <p class="empty" id="empty">아직 아이템이 없어요. 위에서 추가해 보세요.</p>
 
@@ -211,41 +221,78 @@
     (() => {
       'use strict';
 
-      const STORAGE_KEY = 'shopping-list:v1';
+      // 공개(publishable) 키만 사용한다. 권한은 DB의 RLS 정책으로 제한된다.
+      // 서비스(secret) 키는 절대 이 파일에 넣지 않는다.
+      const SUPABASE_URL = 'https://fcsvpmkfssoydajrnymx.supabase.co';
+      const SUPABASE_KEY = 'sb_publishable_NWlCtBEnbh5TjFjpcQmONQ_nvWs3uVS';
+      const TABLE_URL = `${SUPABASE_URL}/rest/v1/shopping_items`;
 
       const form = document.getElementById('add-form');
       const input = document.getElementById('new-item');
       const list = document.getElementById('list');
       const empty = document.getElementById('empty');
       const summary = document.getElementById('summary');
+      const status = document.getElementById('status');
       const clearDoneBtn = document.getElementById('clear-done');
 
       /** @type {{id: string, name: string, done: boolean}[]} */
-      let items = load();
+      let items = [];
+      let loaded = false;      // 첫 로드 완료 여부 (빈 상태 문구 표시용)
+      let pending = 0;         // 진행 중인 서버 쓰기 수
+      let staleRefresh = false; // 쓰기 중에 받은 로드 결과를 버렸는지
+      let writeQueue = Promise.resolve();
 
-      function load() {
-        try {
-          const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]');
-          if (!Array.isArray(parsed)) return [];
-          return parsed.filter(it =>
-            it && typeof it.id === 'string' && typeof it.name === 'string'
-          ).map(it => ({ id: it.id, name: it.name, done: Boolean(it.done) }));
-        } catch {
-          return [];
-        }
+      async function api(method, query = '', body) {
+        const res = await fetch(`${TABLE_URL}${query}`, {
+          method,
+          headers: {
+            apikey: SUPABASE_KEY,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal',
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error(`${method} ${res.status}`);
+        return res.status === 204 || res.headers.get('content-length') === '0'
+          ? null
+          : res.json().catch(() => null);
       }
 
-      function save() {
+      function setStatus(text, isError = false) {
+        status.textContent = text;
+        status.classList.toggle('error', isError);
+      }
+
+      async function load() {
+        const rows = await api('GET', '?select=id,name,done&order=created_at.asc,id.asc');
+        if (!Array.isArray(rows)) return [];
+        return rows.filter(it =>
+          it && typeof it.id === 'string' && typeof it.name === 'string'
+        ).map(it => ({ id: it.id, name: it.name, done: Boolean(it.done) }));
+      }
+
+      // 서버 상태로 다시 그린다. 쓰기 진행 중이면 낙관적 상태를 덮지 않도록 미룬다.
+      async function refresh() {
         try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+          const fresh = await load();
+          if (pending > 0) { staleRefresh = true; return; }
+          items = fresh;
+          loaded = true;
+          setStatus('');
+          render();
         } catch {
-          // 저장 공간 부족, 사생활 보호 모드 등: 메모리에서는 계속 동작
+          setStatus('서버에서 목록을 불러오지 못했어요. 연결을 확인해 주세요.', true);
         }
       }
 
       function newId() {
-        return globalThis.crypto?.randomUUID?.() ??
-          `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+        if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+        // randomUUID는 보안 컨텍스트에서만 제공되므로 UUID v4를 직접 만든다
+        const b = crypto.getRandomValues(new Uint8Array(16));
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        const h = [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+        return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
       }
 
       function render() {
@@ -278,17 +325,36 @@
         list.replaceChildren(fragment);
 
         const doneCount = items.filter(it => it.done).length;
-        empty.hidden = items.length > 0;
+        empty.hidden = !loaded || items.length > 0;
         clearDoneBtn.hidden = doneCount === 0;
         summary.textContent = items.length
           ? `${doneCount} / ${items.length} 구매 완료`
           : '';
       }
 
-      function update(mutator) {
+      // 낙관적 업데이트: 화면을 먼저 바꾸고 서버에 반영한다.
+      // 실패하면 서버 상태를 다시 불러와 화면을 되돌린다.
+      async function update(mutator, persist) {
         mutator();
-        save();
         render();
+        pending++;
+        // 쓰기는 순서대로 하나씩 보낸다 (추가 순서/연속 토글이 서버에서 뒤섞이지 않게)
+        const run = writeQueue.then(persist);
+        writeQueue = run.catch(() => {});
+        try {
+          await run;
+        } catch {
+          staleRefresh = true;
+          setStatus('저장하지 못했어요. 서버의 목록으로 되돌렸어요.', true);
+        } finally {
+          pending--;
+          if (pending === 0 && staleRefresh) {
+            staleRefresh = false;
+            const errorText = status.classList.contains('error') ? status.textContent : '';
+            await refresh();
+            if (errorText) setStatus(errorText, true);
+          }
+        }
       }
 
       form.addEventListener('submit', (e) => {
@@ -299,7 +365,8 @@
           input.focus();
           return;
         }
-        update(() => items.push({ id: newId(), name, done: false }));
+        const item = { id: newId(), name, done: false };
+        update(() => items.push(item), () => api('POST', '', item));
         input.value = '';
         input.focus();
       });
@@ -307,10 +374,11 @@
       list.addEventListener('change', (e) => {
         if (e.target.dataset.action !== 'toggle') return;
         const id = e.target.closest('.item').dataset.id;
+        const done = e.target.checked;
         update(() => {
           const item = items.find(it => it.id === id);
-          if (item) item.done = e.target.checked;
-        });
+          if (item) item.done = done;
+        }, () => api('PATCH', `?id=eq.${encodeURIComponent(id)}`, { done }));
       });
 
       list.addEventListener('click', (e) => {
@@ -320,7 +388,10 @@
         const id = li.dataset.id;
         // 삭제 후 포커스를 다음(또는 이전) 항목으로 이동
         const neighborId = (li.nextElementSibling ?? li.previousElementSibling)?.dataset.id;
-        update(() => { items = items.filter(it => it.id !== id); });
+        update(
+          () => { items = items.filter(it => it.id !== id); },
+          () => api('DELETE', `?id=eq.${encodeURIComponent(id)}`),
+        );
         const target = neighborId
           ? list.querySelector(`[data-id="${CSS.escape(neighborId)}"] .delete`)
           : input;
@@ -328,18 +399,23 @@
       });
 
       clearDoneBtn.addEventListener('click', () => {
-        update(() => { items = items.filter(it => !it.done); });
+        const doneIds = items.filter(it => it.done).map(it => it.id);
+        if (doneIds.length === 0) return;
+        update(
+          () => { items = items.filter(it => !it.done); },
+          () => api('DELETE', `?id=in.(${doneIds.map(encodeURIComponent).join(',')})`),
+        );
         input.focus();
       });
 
-      // 다른 탭에서 변경 시 동기화
-      window.addEventListener('storage', (e) => {
-        if (e.key !== STORAGE_KEY) return;
-        items = load();
-        render();
+      // 다른 탭/기기의 변경 반영: 화면으로 돌아올 때 서버에서 다시 불러온다
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') refresh();
       });
 
+      setStatus('불러오는 중…');
       render();
+      refresh();
     })();
   </script>
 </body>
